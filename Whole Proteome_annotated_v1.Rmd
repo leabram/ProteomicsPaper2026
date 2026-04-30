@@ -1,0 +1,1785 @@
+---
+title: "Differential protein expression"
+author: "Laura Abram adapted from Frank Stein (EMBL, PCF)"
+---
+This analysis pipeline is partly based on an analysis workflow developed by Bernd Klaus.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = TRUE, autodep = TRUE)
+```
+ 
+## Defining a working directory
+This directory should contain the metadata file and the tab delimited text files containing the data.
+```{r echo = FALSE}
+setwd("C:/Users/laura/OneDrive - Cardiff University/Documents/9 - Publications/Proteomics paper/proteomics manuscript and figures V8 LA/CTX and INT annotated script/plots")
+```
+ 
+## Loading packages
+```{r LoadingPackages}
+library(vsn)
+library(limma)
+library(MSnbase)
+library(gplots)
+library(fdrtool)
+library(biobroom)
+library(tidyverse)
+library(UpSetR)
+library(glue)
+library(rstatix)
+library(ggpubr)
+library(Biostrings)
+library(camprotR)
+library(httr)
+library(openxlsx)
+library(tidytext)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(tidyr)
+library(dplyr)
+```
+
+## Defining parameters
+```{r DefiningParameters}
+set.seed(1234) # set seed for reproducibility
+
+script.version <- "V1"
+dir_save <- paste0(script.version, "/", Sys.Date()) #output folder for files and images
+if (!dir.exists(dir_save))
+{dir.create(dir_save)}
+
+```
+
+# Loading data and annotating experimental conditions
+```{r loadRawFiles}
+conditions <- read.delim("metadata_merged.csv", sep = ";") #metadata with LC-MS channels and experimental conditions
+files <- file.path(unique(conditions$file))
+files <- files[file.exists(files)]
+data <- NULL
+for (i in seq_along(files))
+{
+  print(files[i])
+  x <- read_delim(file.path(files[i]), delim = "	")
+  names(x) <- make.names(names(x))
+  x$Gene[is.na(x$Gene)] <- x$Protein.ID[is.na(x$Gene)]
+  
+  x <- x %>%
+    dplyr::filter(Unique.Peptides >= 2)%>% #keep only proteins with at least two unique peptide matches
+    dplyr::filter(Razor.Peptides >= 2) %>% #keep only proteins with at least two razor peptide matches
+    dplyr::filter(!grepl("rev_", Protein))%>%  #remove reverse hits
+    dplyr::filter(!grepl("contam_", Protein)) #remove known contaminants
+  
+  x$file <- files[i]
+  keepnames <- as.character(subset(conditions, file == files[i])$col.name)
+  x <- x[, c("Gene", "Protein.ID", "Protein.Description", "Organism", "Unique.Peptides", "Razor.Peptides", "Total.Intensity", "file", keepnames)]
+  x <- x %>%
+    group_by(Gene, Protein.ID, Protein.Description, Organism, Unique.Peptides, Razor.Peptides, Total.Intensity, file) %>%
+    gather(key = "col.name", value = "value", keepnames)
+  x$Total.Intensity <- as.numeric(as.character(x$Total.Intensity))
+  data <- bind_rows(data, x)
+  rm(x, keepnames)
+}
+rm(i, files)
+data <- left_join(data, conditions)
+data <- subset(data, value > 0)
+```
+#cRAP
+
+```{r cRAP}
+# download the CCP cRAP file if not already present
+outfile <- "CCP_cRAP.fasta"
+if (!file.exists(outfile)) {
+  download_ccp_crap(file = outfile, is_crap = TRUE, overwrite = TRUE, verbose = TRUE)
+} 
+crap_ccp <- readAAStringSet("CCP_cRAP.fasta")
+crap_ids <- str_match(names(crap_ccp), "^[^|]+\\|[^|]+\\|([^|]+)")[,2] # Protein IDs from cRAP
+
+removed_CRAP <- data %>% # Proteins that will be removed
+  filter(Protein.ID %in% crap_ids)%>%
+  dplyr::ungroup()%>%
+  dplyr::select(c(Gene, Protein.ID, Protein.Description))
+removed_CRAP <- removed_CRAP[!duplicated(removed_CRAP), ]
+
+data <- data %>% #remove contaminants from dataset
+  filter(!Protein.ID %in% crap_ids)%>%
+  dplyr::ungroup()
+
+```
+
+#Identification overview
+```{r IdentificationOverview}
+data %>%
+  ungroup() %>%
+  dplyr::select(Gene, condition, sample, rep) %>%
+  distinct() %>%
+  group_split(sample) %>%  # split data into a list by sample
+  purrr::walk(function(df_sample) {
+    sample_name <- unique(df_sample$sample)
+
+    #bar plot of # of identified protein per sample (condition and replicate)
+    p <- ggplot(df_sample, aes(condition, fill = rep)) +
+      geom_bar(position = position_dodge()) +
+      scale_fill_manual(values = c("#009E73", "#5DBB9F", "#B3E2CD"), labels = c("1", "2", "3")) +
+      scale_colour_manual(values = c("#009E73", "#5DBB9F", "#B3E2CD")) +
+      ggtitle(paste0("Protein identification overview - Sample: ", sample_name)) +
+      labs(caption = "proteins with at least 2 razor peptides and 2 unique peptides",
+        x = "Sample", y = "Protein Count", fill = "Replicate")+
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+      theme_classic()+
+      geom_text(aes(label = after_stat(count), y = after_stat(count)),
+        stat = "count", size = 2, position = position_dodge(width = 0.9),
+        hjust = 1, angle = 90)
+
+    ggsave(filename = file.path(dir_save, paste0("Identification_CountOverview_",  sample_name, "_", script.version, "_", Sys.Date(), ".png")),
+      plot = p, width = 5, height = 4, dpi = 600)
+})
+
+# Upset plot for overlapping identified proteins
+upsetR.data <- data %>%
+  mutate(Gene = paste(Gene, Protein.ID, sep = "_")) %>%
+  group_by(Gene, ID) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(identified = 1) %>%
+  dplyr::select(Gene, ID, identified) %>%
+  spread(key = ID, value = identified, fill = 0) %>%
+  as.data.frame()
+colnames(upsetR.data) <- colnames(upsetR.data) %>%
+  str_replace("_(?=[^_]*$)", ":")
+upset.plot <- upset(upsetR.data, order.by = "freq", nsets = 24, mb.ratio = c(0.4, 0.6), nintersects = 30)
+png(file = file.path(dir_save, paste0("Identification_UpSet_plot_", script.version,"_", Sys.Date(), ".png")), width = 3000, height = 3000, res=600)
+print(upset.plot)
+dev.off()
+rm(upset.plot)
+write.csv(upsetR.data, file = file.path(dir_save, paste0("Identification_Overview_", script.version, "_", Sys.Date(),  ".csv")), row.names = FALSE)
+
+```
+
+# Identification and removal of duplicated gene names
+```{r renameDuplicates}
+dup.data <- data %>%
+  ungroup() %>%
+  dplyr::select(Gene, Protein.ID, file, Razor.Peptides) %>%
+  distinct() %>%
+  group_by(file, Gene) %>%
+  dplyr::filter(n() > 1) #if a gene appears in the file more than once assign to dup.data
+if (nrow(dup.data) > 0) #if dup.data exists, save
+{write.csv(dup.data, file.path(dir_save, paste0("Duplicates_", script.version, ".csv")), row.names = FALSE)}
+dups <- unique(dup.data$Gene)
+if (length(dups) > 0)
+{ print("Duplicates were identified:")
+  print(dups)
+  print("Removing genes with smaller numbers of quantified peptides.")
+  for (dup in dups){
+    for (filen in unique(subset(dup.data, Gene == dup)$file)){
+      sub <- subset(data, Gene == dup & file == filen)
+      data <- subset(data, paste(Gene, file) != paste(dup, filen))
+      sub <- subset(sub, Razor.Peptides == max(sub$Razor.Peptides, na.rm = TRUE)) #if duplicates exist, select one with the most peptides
+      data <- bind_rows(data, sub)
+      rm(sub)
+    }
+    rm(filen)
+  }
+  rm(dup)
+}
+
+dup.data <- data %>%
+  ungroup() %>%
+  dplyr::select(Gene, Protein.ID, file, Razor.Peptides) %>%
+  distinct() %>%
+  group_by(file, Gene) %>%
+  dplyr::filter(n() > 1)
+dups <- unique(dup.data$Gene)
+if (length(dups) > 0)
+{print("Duplicates:")
+  print(dups)
+  print("Removing genes with the least overlap of protein ids in other ms experiments")
+  for (dup in dups){
+    sub <- subset(data, Gene %in% dup)
+    IDs <- unlist(strsplit(sub$Protein.ID, split = "[|]"))
+    rm(sub)
+    for (filen in unique(subset(dup.data, Gene == dup)$file)){
+      sub <- subset(data, Gene == dup & file == filen)
+      data <- subset(data, paste(Gene, file) != paste(dup, filen))
+      sub$ID.count <- 0
+      for (ID in unique(sub$Protein.ID)){
+        sub$ID.count[sub$Protein.ID == ID] <- length(which(IDs %in% unlist(strsplit(ID, split = "[|]"))))
+      }
+      sub <- subset(sub, ID.count == max(sub$ID.count, na.rm = TRUE))
+      sub$ID.count <- NULL
+      data <- bind_rows(data, sub)
+      rm(sub)
+    }
+    rm(filen, IDs)
+  }
+  rm(dup)
+}
+rm(dups, dup.data)
+```
+
+# Transforming long data to wide data
+1 row per protein across all samples
+```{r transformLongData2WideData, fig.height = 5}
+#plot of log-transformed reporter ion intensity per sample to see spread and distribution
+ggplot(data = data, aes(condition, log2(value), fill = rep)) + 
+  geom_boxplot() + 
+  ylab("log2(reporter_intensity)") + 
+  facet_grid(. ~ sample, scale = "free_x", space = "free") + 
+  scale_fill_manual(values = c("#009E73", "#5DBB9F", "#B3E2CD"), labels = c("1", "2", "3")  
+                        ) +
+      scale_colour_manual(values = c("#009E73", "#5DBB9F", "#B3E2CD")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+cdata <- data %>%
+  group_by(Gene) %>%
+  mutate(key = paste("reporter_intensity", sample, condition, rep, sep = "_")) %>%
+  dplyr::select(Gene, key, value) %>%
+  group_by(Gene, key) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  spread(key = key, value = value)
+
+fdata <- data %>%
+  group_by(Gene) %>%
+  dplyr::select(Gene, file) %>%
+  distinct() %>%
+  summarise(found.in.files = n()) #how many files each protein appears in
+fdata_i <- data %>%
+  mutate(file2 = make.names(file)) %>%
+  group_by(Gene, file2) %>%
+  dplyr::select(Gene, file, file2) %>%
+  distinct() %>%
+  summarise(found.in.file = n()) %>%
+  mutate(file2 = paste0("found.in.file_", file2)) %>%
+  spread(key = file2, value = found.in.file)
+fdata <- left_join(fdata, fdata_i)
+fdata_i <- data %>%
+  group_by(Gene, sample) %>%
+  dplyr::select(Gene, file, sample) %>%
+  distinct() %>%
+  summarise(found.in.files = n()) %>%
+  mutate(sample = paste0("found.in.files_", sample)) %>%
+  spread(key = sample, value = found.in.files)
+fdata <- left_join(fdata, fdata_i)
+
+fdata_i <- data %>%
+  group_by(Gene) %>%
+  dplyr::select(Gene, condition) %>%
+  distinct() %>%
+  summarise(found.in.conditions = n()) #how many samples/conditions each protein appears in 
+fdata <- left_join(fdata, fdata_i)
+fdata_i <- data %>%
+  group_by(Gene, sample) %>%
+  dplyr::select(Gene, condition, sample) %>%
+  distinct() %>%
+  summarise(found.in.conditions = n()) %>%
+  mutate(sample = paste0("found.in.conditions_", sample)) %>%
+  spread(key = sample, value = found.in.conditions)
+fdata <- left_join(fdata, fdata_i)
+
+fdata_i <- data %>%
+  group_by(Gene) %>%
+  dplyr::select(Gene, rep) %>%
+  distinct() %>%
+  summarise(found.in.reps = n()) #how many replicates each protein appears in 
+fdata <- left_join(fdata, fdata_i)
+fdata_i <- data %>%
+  group_by(Gene, sample) %>%
+  dplyr::select(Gene, rep, sample) %>%
+  distinct() %>%
+  summarise(found.in.reps = n()) %>%
+  mutate(sample = paste0("found.in.reps_", sample)) %>%
+  spread(key = sample, value = found.in.reps)
+fdata <- left_join(fdata, fdata_i)
+
+fdata_i <- data %>%
+  group_by(Gene) %>%
+  dplyr::select(Gene, Unique.Peptides) %>%
+  distinct() %>%
+  summarise(max.Unique.Peptides = max(Unique.Peptides, na.rm = TRUE)) #calculate number of unique peptides
+fdata <- left_join(fdata, fdata_i)
+fdata_i <- data %>%
+  group_by(Gene, sample) %>%
+  dplyr::select(Gene, sample, Unique.Peptides) %>%
+  distinct() %>%
+  summarise(max.Unique.Peptides = max(Unique.Peptides, na.rm = TRUE)) %>%
+  mutate(sample = paste0("max.Unique.Peptides_", sample)) %>%
+  spread(key = sample, value = max.Unique.Peptides)
+fdata <- left_join(fdata, fdata_i)
+
+fdata_i <- data %>%
+  group_by(Gene) %>%
+  dplyr::select(Gene, Razor.Peptides) %>%
+  distinct() %>%
+  summarise(max.Razor.Peptides = max(Razor.Peptides, na.rm = TRUE)) #calculate number of razor peptides per protein
+fdata <- left_join(fdata, fdata_i)
+fdata_i <- data %>%
+  group_by(Gene, sample) %>%
+  dplyr::select(Gene, sample, Razor.Peptides) %>%
+  distinct() %>%
+  summarise(max.Razor.Peptides = max(Razor.Peptides, na.rm = TRUE)) %>%
+  mutate(sample = paste0("max.Razor.Peptides_", sample)) %>%
+  spread(key = sample, value = max.Razor.Peptides)
+fdata <- left_join(fdata, fdata_i)
+
+#abundance overview
+fdata_i <- data %>%
+  group_by(Gene) %>%
+  dplyr::select(Gene, Total.Intensity) %>%
+  distinct() %>%
+  summarise(average.Total.Intensity = mean(Total.Intensity, na.rm = TRUE)) #calculate mean total reporter ion intensity across all samples
+fdata <- left_join(fdata, fdata_i)
+fdata_i <- data %>%
+  group_by(Gene, sample) %>%
+  dplyr::select(Gene, sample, Total.Intensity) %>%
+  distinct() %>%
+  summarise(average.Total.Intensity = mean(Total.Intensity, na.rm = TRUE)) %>%
+  mutate(sample = paste0("average.Total.Intensity_", sample)) %>%
+  spread(key = sample, value = average.Total.Intensity)
+fdata <- left_join(fdata, fdata_i)
+id_data <- data %>%
+  ungroup() %>%
+  dplyr::select(Gene, Protein.ID, Protein.Description, Organism) %>%
+  distinct()
+dups <- id_data %>%
+  group_by(Gene) %>%
+  summarize(n = n()) %>%
+  dplyr::filter(n > 1) %>%
+  dplyr::select(Gene)
+if (nrow(dups) > 0)
+{ dups <- dups$Gene
+  dup.data <- subset(id_data, Gene %in% dups)
+  id_data <- subset(id_data, !Gene %in% dups)
+  combine_ids <- function(ids)
+  { ids <- as.character(ids)
+    return(paste(
+      sort(unique(unlist(strsplit(ids, split = "[;]")))), collapse = ";"))
+  }
+  dup.data <- dup.data %>%
+    group_by(Gene) %>%
+    summarise(Protein.ID = combine_ids(Protein.ID), 
+              Protein.Description = combine_ids(Protein.Description), 
+              Organism = combine_ids(Organism))
+  id_data <- bind_rows(id_data, dup.data)
+  rm(dup.data, combine_ids)
+}
+rm(dups)
+fdata <- left_join(id_data, fdata)
+rm(id_data)
+cdata <- left_join(fdata, cdata)
+rm(fdata_i, fdata)
+```
+
+# Filter data
+At least 2 razor peptides and 2 unique peptides for a protein to be kept in the dataset
+```{r filterData}
+dim(cdata)
+min.found.in.files <- 1
+min.Razor.Peptides <- 2
+
+for (s in unique(conditions$sample))
+{ cname <- paste0("keep_", s)
+  cdata[, cname] <- ifelse(
+    cdata[, paste0("found.in.files_", s)] >= 
+      min.found.in.files & cdata[, paste0("max.Razor.Peptides_", s)] >= min.Razor.Peptides, TRUE, FALSE)
+  cdata[is.na(cdata[, cname]), cname] <- FALSE
+  rm(cname)}
+rm(s)
+cdata$keep <- FALSE
+
+min.Unique.Peptides <- 2
+for (s in unique(conditions$sample))
+{ cname <- paste0("keep_", s)
+  cdata[, cname] <- ifelse(
+    cdata[, paste0("found.in.files_", s)] >= 
+      min.found.in.files & cdata[, paste0("max.Unique.Peptides_", s)] >= min.Unique.Peptides, TRUE, FALSE)
+  cdata[is.na(cdata[, cname]), cname] <- FALSE
+  rm(cname)}
+rm(s)
+cdata$keep <- FALSE
+for (i in seq_along(rownames(cdata)))
+{ cdata$keep[i] <- any(as.logical(cdata[i, grep("keep_", names(cdata), value = TRUE)]))}
+rm(i)
+cdata <- subset(cdata, keep)
+dim(cdata)
+rm(min.found.in.files, min.Razor.Peptides, min.Unique.Peptides)
+
+#summarise number of proteins kept and number removed
+n_unique<-data %>%
+  group_by(sample) %>%
+  summarise(n_unique_proteins = n_distinct(Protein.ID))
+print(paste0("# unique proteins after all filtering:", n_unique))
+
+#save long-format data after contaminants, reverse hits and <2 unique/razor peptides removed
+write.csv(data, file.path(dir_save, paste0("Data after quality control_", script.version, "_", Sys.Date(), ".csv")),
+              row.names = FALSE) #supplementary file 1.3
+```
+
+# Building an expression set object
+Used for Limma analysis
+```{r buildingEset}
+# Constructing assay data
+raw_data <- cdata %>%
+  dplyr::select(starts_with("reporter_intensity")) %>%
+  as.data.frame()
+rownames(raw_data) <- cdata$Gene
+names(raw_data) <- gsub("reporter_intensity_", "", names(raw_data))
+
+# Constructing metadata
+conditions_i <- data.frame(ID = names(raw_data))
+conditions_i <- left_join(conditions_i, conditions)
+
+# Constructing fdata
+fdata <- cdata %>%
+  dplyr::select(-starts_with("reporter_intensity")) %>%
+  as.data.frame()
+
+# Defining ID columns
+rownames(fdata) <- fdata$Gene
+rownames(conditions_i) <- conditions_i$ID
+colnames(raw_data) <- conditions_i$ID
+
+# Log2-transformation of raw_reporter_intensity values
+raw_data_m <- log2(as.matrix(raw_data))
+raw_data_m[is.infinite((raw_data_m))] <- NA
+raw_data_m[is.na((raw_data_m))] <- NA
+
+# Creating an expression set
+raw_dataE <- ExpressionSet(assayData = raw_data_m,  #feature intensities (raw ion intensity for each channel)
+                           phenoData = AnnotatedDataFrame(conditions_i), #metadata describing samples
+                           featureData = AnnotatedDataFrame(fdata)) #metadata describing features (proteinID, etc)
+validObject(raw_dataE)
+rm(raw_data, raw_data_m, conditions_i, fdata)
+```
+
+# Batch effect removal
+
+```{r removingBatchEffects}
+batchcl_dataE <- raw_dataE
+# CTX/INT samples corrected seaprately.
+for (s in unique(conditions$sample))
+{ batchcl_dataE_i <-  # Subset the data for the current sample and exclude missing values.
+    batchcl_dataE[fData(batchcl_dataE)[, paste0("keep_", s)], 
+                      batchcl_dataE$sample == s]
+  
+  exprs_available <- exprs(batchcl_dataE_i) # Extract the available (non-missing) expression values.
+  
+  non_missing_indices <- complete.cases(exprs_available) # Identify rows where all values are non-missing.
+  
+  exprs(batchcl_dataE_i)[non_missing_indices, ] <-  # Apply batch effect removal only to the non-missing values.
+    removeBatchEffect(exprs_available[non_missing_indices, ], 
+      batch = as.character(pData(batchcl_dataE_i)$rep), 
+      design = model.matrix(~0 + as.character(pData(batchcl_dataE_i)$condition)))
+
+  for (cn in colnames(batchcl_dataE_i))  # Write the batch-effect cleaned values back into the main data.
+  {exprs(batchcl_dataE)[fData(batchcl_dataE)[, paste0("keep_", s)], cn] <- 
+      exprs(batchcl_dataE_i)[, cn]}
+  rm(cn)
+}
+rm(s)
+```
+
+# Data normalization
+The vsn package from Wolfgang Huber is used to apply a variance stabilization normalization method on the log2 raw data.
+```{r DataNormalization}
+norm_dataE <- batchcl_dataE
+for (s in unique(conditions$sample))
+{ print(paste0(s))
+  norm_input.data_i <- 2^exprs(norm_dataE[
+    fData(norm_dataE)[, paste0("keep_", s)], 
+    norm_dataE$sample == s])
+  norm_dataE_i <- normalizeVSN(norm_input.data_i)
+  for (cn in colnames(norm_dataE_i))
+  {exprs(norm_dataE)[fData(norm_dataE)[, paste0("keep_", s)], cn] <- 
+      norm_dataE_i[, cn]}
+  rm(cn, norm_dataE_i)
+  sdplot.object <- meanSdPlot(vsn2(norm_input.data_i), plot = FALSE)
+  print(sdplot.object$gg + ggtitle(s))
+  rm(sdplot.object, norm_input.data_i)
+}
+rm(s)
+```
+
+# PCA - principal component analysis
+```{r CreatePCAplots, fig.height = 5}
+sets <- list("Raw data" = raw_dataE, "Batch corrected data" = batchcl_dataE, "Normalised data" = norm_dataE)
+PCA_data <- NULL
+for (i in seq_along(sets)) {
+  set <- sets[[i]]
+  set.name <- names(sets)[i]
+  for (s in unique(conditions$sample)) {
+    set_s <- set[, set$sample == s]
+    PCA_m <- t(na.omit(exprs(set_s)))
+    if (length(PCA_m) > 50) {
+      PCA <- prcomp(PCA_m, scale = FALSE)
+      perc_var <-
+        round(100 * PCA$sdev ^ 2 / #expressed as a percentage of the total dataset variance
+                sum(PCA$sdev ^ 2), 1)
+      PCA_data_i <-
+        data.frame(PC1 = PCA$x[, 1],
+                   PC2 = PCA$x[, 2],
+                   PC3 = PCA$x[, 3],
+                   PC1.var = perc_var[1],
+                   PC2.var = perc_var[2],
+                   sample = pData(set_s)$sample,
+                   condition = pData(set_s)$condition,
+                   rep = pData(set_s)$rep,
+                   measurement = set.name)
+      PCA_data <- bind_rows(PCA_data, PCA_data_i)
+      rm(PCA_data_i)
+    }
+  }
+  rm(s)
+}
+rm(i)
+PCA_data$measurement <- factor(PCA_data$measurement, ordered = TRUE, levels = c("Raw data", "Batch corrected data", "Normalised data"))
+
+PCA_data <- PCA_data %>%
+  mutate(fraction = sub("_.*", "", condition),               # Create new columns for outline and fill
+    genotype = if_else(str_ends(condition, "C"), "WT", "PT"))
+
+unique_samples <- unique(PCA_data$sample)
+
+#CTX and INT samples plotted separately
+for (sample_name in unique_samples) {
+  data_sub <- PCA_data %>% filter(sample == sample_name)
+  
+  p <- ggplot(data_sub, aes(PC1, PC2)) +
+    geom_point(aes(fill = condition, colour = condition), shape = 21, size = 3, stroke = 1.2) +
+    scale_fill_manual(values = c(
+      "cytosol" = "#FFFFFF", 
+      "cytosol_C" = "#D55E00",
+      "membrane" = "#FFFFFF",
+      "membrane_C" = "#0072B2")) +
+    scale_colour_manual(values = c(
+      "cytosol" = "#D55E00", 
+      "cytosol_C" = "#D55E00",
+      "membrane" = "#0072B2",
+      "membrane_C" = "#0072B2")) +
+    theme_minimal()+
+    ggtitle(paste0("Principal Component analysis")) +
+    xlab("PC1") +
+    ylab("PC2") +
+    facet_wrap(~ measurement + paste("PC1:", PC1.var, "% var - PC2:", PC2.var, "% var"), scales = "free", ncol = 4)
+  
+  ggsave(filename = file.path(dir_save, paste0("PCA_analysis_", script.version, "_", sample_name, "_", Sys.Date(), ".png")),
+    plot = p, width = 11, height = 4, dpi = 600)
+  
+  write.csv(data_sub, file = file.path(dir_save, paste0("PCA_analysis_data_", script.version, "_", sample_name, "_", Sys.Date(), ".csv")), row.names = FALSE)
+}
+
+#both CTX and INT PCA in one plot 
+p <- ggplot(PCA_data, aes(PC1, PC2)) +
+  geom_point(aes(fill = condition, colour = condition), shape = 21, size = 3, stroke = 1.2) +
+  scale_fill_manual(values = c(
+    "cytosol" = "#FFFFFF", 
+    "cytosol_C" = "#D55E00",
+    "membrane" = "#FFFFFF",
+    "membrane_C" = "#0072B2")) +
+  scale_colour_manual(values = c(
+    "cytosol" = "#D55E00", 
+    "cytosol_C" = "#D55E00",
+    "membrane" = "#0072B2",
+    "membrane_C" = "#0072B2")) +
+  theme_minimal()+
+  ggtitle(paste0("Principal Component analysis")) +
+  xlab("PC1") +
+  ylab("PC2") +
+  facet_wrap(sample~ measurement + paste("PC1:", PC1.var, "% var - PC2:", PC2.var, "% var"), scales = "free", ncol = 3)
+
+ggsave(filename = file.path(dir_save, paste0("PCA_analysis_", script.version, "_",  Sys.Date(), ".png")),
+  plot = p, width = 11, height = 6, dpi = 600)
+
+write.csv(PCA_data, file = file.path(dir_save, paste0("PCA_analysis_data_", script.version, "_", Sys.Date(), ".csv")), row.names = FALSE)
+```
+
+# Merge modified data back into 'cdata'
+
+```{r CreateCastedData}
+cdata_i <- as.data.frame(2^exprs(batchcl_dataE))
+names(cdata_i) <- paste0("batchcl_reporter_intensity_", names(cdata_i))
+cdata_i$Gene <- rownames(cdata_i)
+cdata <- left_join(cdata, cdata_i)
+rm(cdata_i)
+
+cdata_i <- as.data.frame(2^exprs(norm_dataE))
+names(cdata_i) <- paste0("norm_reporter_intensity_", names(cdata_i))
+cdata_i$Gene <- rownames(cdata_i)
+cdata <- left_join(cdata, cdata_i)
+rm(cdata_i)
+
+write.csv(cdata, file = file.path(dir_save, paste0("Full_dataset_", script.version, ".csv")), row.names = FALSE) #supp. file 1.4
+```
+
+# Create tidy data
+```{r CreateTidyData}
+mdata <- NULL
+
+mdata_i <- tidy(raw_dataE)
+mdata_i <- mdata_i %>%
+  mutate(value = 2 ^ value)
+names(mdata_i)[1] <- "Gene"
+names(mdata_i)[2] <- "ID"
+mdata_i <- left_join(mdata_i, conditions)
+mdata_i$measurement <- "raw_reporter_intensity"
+mdata <- bind_rows(mdata, mdata_i)
+rm(mdata_i)
+
+mdata_i <- tidy(batchcl_dataE)
+mdata_i <- mdata_i %>%
+  mutate(value = 2 ^ value)
+names(mdata_i)[1] <- "Gene"
+names(mdata_i)[2] <- "ID"
+mdata_i <- left_join(mdata_i, conditions)
+mdata_i$measurement <- "batchcl_reporter_intensity"
+mdata <- bind_rows(mdata, mdata_i)
+rm(mdata_i)
+
+mdata_i <- tidy(norm_dataE)
+mdata_i <- mdata_i %>%
+  mutate(value = 2 ^ value)
+names(mdata_i)[1] <- "Gene"
+names(mdata_i)[2] <- "ID"
+mdata_i <- left_join(mdata_i, conditions)
+mdata_i$measurement <- "norm_reporter_intensity"
+mdata <- bind_rows(mdata, mdata_i)
+rm(mdata_i)
+
+mdata$condition <- factor(mdata$condition, ordered = TRUE, levels = c("cytosol_C", "cytosol", "membrane_C", "membrane"))
+mdata$measurement <- factor(mdata$measurement, ordered = TRUE, levels = c("raw_reporter_intensity", "batchcl_reporter_intensity", "norm_reporter_intensity"))
+```
+
+# Data transformation overview
+box plot of raw/batch corrected/normalised data across all 3 stages
+```{r DataTransformationOverview}
+customPlot2 <- list(
+  theme_bw(base_size = 12), 
+  scale_shape_manual(values = 21), 
+  scale_fill_manual(values = c("#FFFFFF", "#D55E00", "#FFFFFF", "#0072B2")), 
+  scale_colour_manual(values = c("#D55E00", "#D55E00", "#0072B2", "#0072B2")))
+
+mdata$condition <- factor(mdata$condition, ordered = TRUE, levels = c("cytosol", "cytosol_C", "membrane", "membrane_C"))
+new_labels <- c(raw_reporter_intensity = "Raw data",
+  batchcl_reporter_intensity = "Batch corrected data",
+  norm_reporter_intensity = "Normalised data")
+
+# Individual plots by sample
+samples <- unique(mdata$sample)
+for (sample_name in samples) {
+  data_no_ratio <- mdata %>% filter(sample == sample_name)
+  p1 <- ggplot(data_no_ratio, aes(x=condition, y=log2(value), group = interaction(condition, rep))) +
+    geom_boxplot(aes(fill = condition, colour=condition)) +
+  stat_summary(
+    data = subset(data_no_ratio, condition %in% c("cytosol_C", "membrane_C")),
+    fun = median, geom = "crossbar",
+    width = 0.7, colour = "white",
+    fatten = 2, position = position_dodge(width = 0.75),
+    aes(group = interaction(condition, rep)))+
+    customPlot2 +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    ggtitle(paste("Data Transformation Overview")) +
+    theme_minimal()+
+    facet_grid(. ~ measurement, labeller = labeller(measurement = new_labels)) +
+  ylab("Log2(Reporter intensity)")
+  try({
+    ggsave(file.path(dir_save, paste0("Normalization_overview_",  sample_name, "_", script.version, "_", Sys.Date(), ".png")),
+           plot = p1, width = 11, height = 4, dpi = 150)
+  }, silent = TRUE)
+  while (!is.null(dev.list())) dev.off()
+  
+  try({
+    write.csv(data_no_ratio, file.path(dir_save, paste0("Normalization_overview_data_",  sample_name, "_", script.version, "_", Sys.Date(), ".csv")), row.names = FALSE)
+  }, silent = TRUE)
+  
+  rm(p1)
+  gc()
+}
+
+# Plot both samples together
+data_no_ratio <- data_no_ratio %>%
+  pivot_wider(names_from = measurement,
+    values_from = value)
+data_no_ratio <- na.omit(data_no_ratio)
+
+write.csv(data_no_ratio, file.path(dir_save, paste0("Normalization_overview_data_cleaned_",  sample_name, "_", script.version, "_", Sys.Date(), ".csv")), row.names = FALSE)
+
+data_no_ratio <- mdata %>% filter(!grepl("ratio", measurement))
+  p3 <- ggplot(data_no_ratio, aes(x=condition, y=log2(value), group = interaction(condition, rep))) +
+    geom_boxplot(aes(fill = condition, colour=condition)) +
+  stat_summary(
+    data = subset(data_no_ratio, condition %in% c("cytosol_C", "membrane_C")),
+    fun = median,
+    geom = "crossbar",
+    width = 0.7,
+    colour = "white",
+    fatten = 2,
+    position = position_dodge(width = 0.75),
+    aes(group = interaction(condition, rep)))+
+    customPlot2 +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    ggtitle(paste("Data Transformation Overview")) +
+    theme_minimal()+
+    facet_grid(sample ~ measurement, labeller = labeller(measurement = new_labels)) +
+  ylab("Log2(Reporter intensity)")
+  try({
+    ggsave(file.path(dir_save, paste0("Normalization_overview_",  script.version, "_", Sys.Date(), ".png")),
+           plot = p3, width = 11, height = 4, dpi = 600)
+  }, silent = TRUE)
+  while (!is.null(dev.list())) dev.off()
+  
+  try({
+    write.csv(data_no_ratio, file.path(dir_save, paste0("Normalization_overview_data_",  script.version, "_", Sys.Date(), ".csv")),
+              row.names = FALSE)
+  }, silent = TRUE)
+```
+
+# CV overview (coefficient of variation)
+to check if data normalisation has stabilised variance independent of mean
+```{r CVOverview, fig.height = 6}
+cv.data <- mdata %>%
+  group_by(Gene, measurement, sample, condition) %>%
+  summarise(CV = sd(value, na.rm = TRUE) / mean(value, na.rm = TRUE))
+cv.data.all <- mdata %>%
+  mutate(condition = "all") %>%
+  group_by(Gene, measurement, sample, condition) %>%
+  summarise(CV = sd(value, na.rm = TRUE) / mean(value, na.rm = TRUE))
+cv.data <- bind_rows(cv.data, cv.data.all)
+rm(cv.data.all)
+ggplot(data = cv.data, aes(condition, CV * 100)) +
+  geom_violin() +
+  geom_boxplot(width = 0.1) +
+
+  ggtitle("CV overview") +
+  ylab("CV [%]") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  facet_grid(sample ~ measurement)
+ggsave(file.path(dir_save, paste0("CV_overview_", script.version, ".png")), width = 12, height = 10)
+```
+
+# LIMMA analysis
+A protein is considered a 'hit', if the false discovery rate is smaller 0.05 and an absolute log2 fold-change of at least log2(1.5) is observed. 
+If separate datasets (sample grouping) are being analysed in the same dataset, Limma used to compare within each dataset, not as a whole
+```{r LimmaInitialization}
+limma_results <- NULL
+```
+
+## Run limma analysis
+CTX and INT samples run separately
+
+```{r LimmaRun}
+for (s in unique(conditions$sample))
+{ limma_data <- norm_dataE[
+    fData(norm_dataE)[, paste0("keep_", s)], 
+    norm_dataE$sample == s]
+  limma_weights <- 
+    exprs(raw_dataE[fData(raw_dataE)[, paste0("keep_", s)], 
+                    raw_dataE$sample == s])
+  #compare effect of genotype and fraction separation
+  comparison.list <- c("cytosol - cytosol_C", "membrane - membrane_C", "membrane - cytosol", "membrane_C - cytosol_C")
+  limma_weights <- ifelse(is.na(limma_weights), 0.01, 1) #assign low weight to missing values
+  limma.cond <- factor(pData(limma_data)$condition, ordered = FALSE)
+  limma.rep <- factor(pData(limma_data)$rep, ordered = FALSE)
+  design.matrix <- model.matrix( ~  0 + limma.cond + limma.rep)
+  colnames(design.matrix) <- gsub("limma.cond", "", colnames(design.matrix))
+  
+  limma.object <- eBayes(
+    contrasts.fit(lmFit(limma_data, design = design.matrix, weights = limma_weights), 
+      makeContrasts(contrasts = comparison.list, levels = design.matrix))
+  )
+  for (comparison in comparison.list){
+    limma_results_i <- limma::topTable(limma.object, 
+                           sort.by = "t",  
+                           coef = comparison, 
+                           number = Inf)
+    names(limma_results_i)[grep("P.Value", names(limma_results_i))] <- "pvalue.limma"
+    names(limma_results_i)[grep("adj.P.Val", names(limma_results_i))] <- "fdr.limma"
+    limma_results_i <- subset(limma_results_i, !is.na(logFC))
+    fdr_res <- NULL#also use FDRtool to calculate false discovery rate to independently check Limma results
+    try(fdr_res <- fdrtool(limma_results_i$t, plot = FALSE, verbose = FALSE))
+    if (!is.null(fdr_res))
+    {limma_results_i$pvalue.fdrtool <- fdr_res$pval
+      limma_results_i$qval.fdrtool <- fdr_res$qval
+      limma_results_i$lfdr.fdrtool <- fdr_res$lfdr
+    }
+    else {
+      limma_results_i$pvalue.fdrtool <- 1
+      limma_results_i$qval.fdrtool <- 1
+      limma_results_i$lfdr.fdrtool <- 1}
+    
+    comparison.label <- gsub("\\) - \\(", ") against (", comparison)
+    comparison.label <- gsub(" - ", " vs ", comparison.label)
+    limma_results_i$comparison <- comparison
+    limma_results_i$comparison.label <- comparison.label
+    limma_results_i$sample <- s
+    limma_results <- bind_rows(limma_results, limma_results_i)
+    rm(limma_results_i, fdr_res)
+  }
+  rm(comparison.list, comparison, design.matrix, limma.cond, limma.rep, limma_data, limma_weights, limma.object)
+}
+rm(s)
+```
+
+## Fdr statistics comparison limma vs fdrtool
+```{r LimmaFDRcomparison, fig.height = 7}
+customPlot3 <- list(
+  theme_bw(base_size = 12), 
+  scale_shape_manual(values = 21), 
+  scale_fill_manual(values = c("#e41a1c", "#009E73")), 
+  scale_colour_manual(values = c("#e41a1c", "#009E73")))
+
+samples <- unique(limma_results$sample)
+for (s in samples) {
+  # Subset data for current sample
+  dat_sub <- subset(limma_results, sample == s)
+  
+  # Plot 1: t vs fdr
+  p1 <- ggplot(dat_sub, aes(abs(t))) + 
+    geom_line(aes(y = fdr.limma, colour = "limma - adj.P.Val")) + 
+    geom_line(aes(y = qval.fdrtool, colour = "fdrtool - qval")) + 
+    geom_point(aes(y = fdr.limma, colour = "limma - adj.P.Val")) + 
+    geom_point(aes(y = qval.fdrtool, colour = "fdrtool - qval")) + 
+    facet_wrap(~ paste0(sample, ": ", comparison.label), scales = "free_x") + 
+    ylab("fdr") + 
+    customPlot3 +
+    ggtitle(paste0("FDR comparison limma vs fdrtool - Sample: ", s))
+  
+  ggsave(filename = file.path(dir_save, paste0("t_vs_fdr_limma_vs_fdrtool_", s, "_", script.version, "_", Sys.Date(), ".png")),
+    plot = p1, width = 20, height = 13.5, dpi = 300)
+  
+  # Plot 2: p-value histogram
+  p2 <- ggplot(dat_sub) + 
+    geom_histogram(aes(pvalue.limma, alpha = 0.5, fill = "limma"), bins = 40) + 
+    geom_histogram(aes(pvalue.fdrtool, alpha = 0.5, fill = "fdrtool"), bins = 40) + 
+    guides(alpha = FALSE) + 
+    xlab("p-value") + 
+    facet_wrap(~ paste0(sample, ": ", comparison.label), scales = "free_y") +
+    coord_cartesian(xlim = c(0, 1)) +
+    customPlot3 +
+    ggtitle(paste0("p-value histogram limma vs fdrtool - Sample: ", s))
+  
+  ggsave(filename = file.path(dir_save, paste0("p-value_histogram_limma_vs_fdrtool_", s, "_", script.version, "_", Sys.Date(), ".png")),
+    plot = p2, width = 20, height = 13.5, dpi = 600)
+}
+```
+
+## Hit annotation - All proteins
+```{r LimmaHitAnnotation}
+limma_results$hit_annotation_method <- NA
+fdr_hit_threshold <- 0.05 #FDR threshold
+fc_hit_threshold <- 1.5 #Fold-change threshold
+limma_results$pvalue <- NA
+limma_results$fdr <- NA
+limma_results$comparison.old <- limma_results$comparison
+limma_results$comparison <- with(limma_results, paste0(sample, ": ", comparison))
+for (comparison in unique(limma_results$comparison))
+{limma_hits <- 
+    nrow(limma_results[limma_results$comparison == comparison & 
+                         limma_results$fdr.limma <= fdr_hit_threshold, ])
+  fdrtool_hits <- 
+    nrow(limma_results[limma_results$comparison == comparison & 
+                         limma_results$qval.fdrtool <= fdr_hit_threshold, ])
+  if (limma_hits >= fdrtool_hits) {
+    limma_results$hit_annotation_method[limma_results$comparison == comparison] <- "limma"}
+  if (fdrtool_hits > limma_hits)
+  {limma_results$hit_annotation_method[limma_results$comparison == comparison] <- "fdrtool"}
+  rm(limma_hits, fdrtool_hits)
+}
+
+table(limma_results$hit_annotation_method)
+limma_results$hit_annotation_method[!grepl("[(,)]", limma_results$comparison)] <- "limma"
+
+limma_results$pvalue[limma_results$hit_annotation_method == "limma"] <- 
+  limma_results$pvalue.limma[limma_results$hit_annotation_method == "limma"]
+limma_results$fdr[limma_results$hit_annotation_method == "limma"] <- 
+  limma_results$fdr.limma[limma_results$hit_annotation_method == "limma"]
+
+limma_results$pvalue[limma_results$hit_annotation_method == "fdrtool"] <- 
+  limma_results$pvalue.fdrtool[limma_results$hit_annotation_method == "fdrtool"]
+limma_results$fdr[limma_results$hit_annotation_method == "fdrtool"] <- 
+  limma_results$qval.fdrtool[limma_results$hit_annotation_method == "fdrtool"]
+
+limma_results$hit <- 
+  with(limma_results, ifelse(fdr <= fdr_hit_threshold & abs(logFC) >= 
+                               log2(fc_hit_threshold), TRUE, FALSE))
+limma_results$hit_annotation <- with(limma_results,
+  ifelse(fdr <= fdr_hit_threshold & abs(logFC) >= log2(fc_hit_threshold),
+         "hit", "no hit"))
+limma_results$hit_annotation <- 
+  factor(limma_results$hit_annotation, 
+         ordered = TRUE, 
+         levels = c("hit", "no hit"))
+caption.text_DE = glue("hit: fdr <= {fdr_hit_threshold} & absolute log2(fold-change) >= log2({fc_hit_threshold})")
+
+with(limma_results, table(sample, comparison, hit_annotation))
+limma_results$comparison <- limma_results$comparison.old
+limma_results$comparison.old <- NULL
+
+# Save limma results : supp file 1.5
+write.csv(limma_results, file.path(dir_save, paste0("Limma_results_ALL_", script.version,"_", Sys.Date(), ".csv")), row.names = FALSE) 
+```
+
+#human protein atlas - neuron elevated
+```{r HumanProteinAtlasBrainExpression}
+#filter hits to keep any protein listed in the Human Protein Atlast as elevated expression in neurons
+## this dataset is 3795 proteins published here https://www.proteinatlas.org/humanproteome/brain 
+
+ProteinAtlasWhole <- read.xlsx("C:/Users/laura/OneDrive - Cardiff University/Documents/3 - PhD/Proteomics/human protein atlas dataset all neuron total elevated.xlsx", sheet = 1)
+
+limma_wholebrain_removed<-limma_results%>% #save dataset of hits being removed (non-neuronal enriched)
+  dplyr::filter(!(Gene %in% ProteinAtlasWhole$Gene)&
+         !(Protein.ID %in% ProteinAtlasWhole$Uniprot) )%>%
+  dplyr::filter(comparison %in% c("cytosol - cytosol_C", "membrane - membrane_C"))%>% #select Patient-Control comparisons
+  dplyr::filter(hit == "TRUE")
+write.csv(limma_wholebrain_removed, file.path(dir_save, paste0("Limma_results_Neuron removed_", script.version,"_", Sys.Date(), ".csv")), row.names = FALSE) 
+
+limma_results<-limma_results%>% #filter Limma results for proteins in Human Protein Atlas
+  dplyr::filter(Gene %in% ProteinAtlasWhole$Gene|
+         Protein.ID %in% ProteinAtlasWhole$Uniprot )
+
+write.csv(limma_results, file.path(dir_save, paste0("Limma_results_Neuron enriched_", script.version,"_", Sys.Date(), ".csv")), row.names = FALSE) #supp file 1.6
+
+unique_hits<-as.data.frame(limma_results)%>% #to see unique list of differentially expressed proteins
+  filter(hit==TRUE)%>%
+  dplyr::select(Gene, sample, comparison, logFC)%>%
+  distinct()%>%
+  mutate(direction = case_when(
+    logFC > 0 ~ "Up",
+    logFC < 0 ~ "Down",
+    TRUE ~ "NoChange"   # optional: handles cases where logFC == 0 or NA
+  ))
+sample_only <- unique_hits %>%
+  group_by(sample) %>%
+  filter(comparison %in% c("membrane - cytosol","membrane_C - cytosol_C"))%>%
+  distinct()%>%
+  summarise(count = n(), .groups = "drop")
+fraction_only <- unique_hits %>%
+  group_by(sample, comparison) %>%
+  distinct()%>%
+  summarise(count = n(), .groups = "drop")
+fraction_direction <- unique_hits %>%
+  group_by(sample, comparison, direction) %>%
+  distinct()%>%
+  summarise(count = n(), .groups = "drop")
+
+print(fraction_only)
+print(fraction_direction)
+```
+
+# Volcano-plot
+```{r LimmaVolcanoPlot, fig.height = 7}
+samples <- unique(limma_results$sample)
+customPlot_DE2 <- list(
+  theme_bw(base_size = 12), 
+  scale_shape_manual(values = c(16, 17, 15, 3, 7, 8)), 
+  scale_colour_manual(values = c("hit" = "#1f78b4", "no hit" = "#555555")),
+  scale_alpha_manual(values = c("hit" = 1,  "no hit" = 0.1)))
+
+
+#CTX/INT and volcano plots together - effect of genotype
+dat_sample <- limma_results%>%
+  filter(comparison %in% c("cytosol - cytosol_C", "membrane - membrane_C"))
+  
+volcano_labels <- dat_sample %>%
+  group_by(sample, comparison.label) %>%
+  summarise(up_hits = sum(hit_annotation == "hit" & logFC > 0),
+          down_hits = sum(hit_annotation == "hit" & logFC < 0),
+          total_points = n(), .groups = "drop")
+
+p <- ggplot(dat_sample, aes(logFC, -log10(pvalue), colour = hit_annotation, alpha = hit_annotation)) +
+  geom_vline(xintercept = 0, colour = "lightgrey") +
+  geom_hline(yintercept = -Inf, colour = "black") +
+  geom_vline(xintercept = -Inf, colour = "black") +
+  geom_point() +
+  geom_text(aes(label = gsub("[|].+", "", Gene)), colour = "black",
+    show.legend = FALSE,
+    data = subset(dat_sample, hit_annotation == "hit"),
+    vjust = 0, nudge_y = 0.1, size = 2, check_overlap = TRUE) +
+  facet_grid(sample~comparison.label, scales ="fixed") +
+  xlab("log2(fold-change)") +
+  customPlot_DE2 +
+  theme_classic() +
+  theme(strip.background = element_blank(),)+
+  geom_text(data = volcano_labels, aes(x = -3.5, y = 0,
+      label = paste0(
+        "Upregulated hits: ", up_hits, "\n",
+        "Downregulated hits: ", down_hits, "\n",
+        "Total: ", total_points)),
+    hjust = 0, vjust = 0, inherit.aes = FALSE, size = 2.5, colour = "black") +
+  coord_cartesian(clip = "off")+
+  labs(colour = "Hit annotation", alpha = "Hit annotation") 
+
+ggsave(filename = file.path(dir_save, paste0("Volcano_plot_genotype_", script.version, "_", Sys.Date(), ".png" )),
+  plot = p, width =10, height = 6)
+
+#CTX/INT and volcano plots together - effect of fraction
+dat_sample <- limma_results%>%
+  filter(comparison %in% c("membrane - cytosol", "membrane_C - cytosol_C"))
+  
+volcano_labels <- dat_sample %>%
+  group_by(sample, comparison.label) %>%
+  summarise(up_hits = sum(hit_annotation == "hit" & logFC > 0),
+          down_hits = sum(hit_annotation == "hit" & logFC < 0),
+          total_points = n(), .groups = "drop")
+
+p <- ggplot(dat_sample, aes(logFC, -log10(pvalue), colour = hit_annotation, alpha = hit_annotation)) +
+  geom_vline(xintercept = 0, colour = "lightgrey") +
+  geom_hline(yintercept = -Inf, colour = "black") +
+  geom_vline(xintercept = -Inf, colour = "black") +
+  geom_point() +
+  geom_text(aes(label = gsub("[|].+", "", Gene)), colour = "black",
+    show.legend = FALSE,
+    data = subset(dat_sample, hit_annotation == "hit"),
+    vjust = 0, nudge_y = 0.1, size = 2, check_overlap = TRUE) +
+  facet_grid(sample~comparison.label, scales ="fixed") +
+  xlab("log2(fold-change)") +
+  customPlot_DE2 +
+  theme_classic() +
+  theme(strip.background = element_blank(),)+
+  geom_text(data = volcano_labels, aes(x = -3.5, y = 0,
+      label = paste0(
+        "Upregulated hits: ", up_hits, "\n",
+        "Downregulated hits: ", down_hits, "\n",
+        "Total: ", total_points)),
+    hjust = 0, vjust = 0, inherit.aes = FALSE, size = 2.5, colour = "black") +
+  coord_cartesian(clip = "off")+
+  labs(colour = "Hit annotation", alpha = "Hit annotation") 
+
+ggsave(filename = file.path(dir_save, paste0("Volcano_plot_fraction_", script.version, "_", Sys.Date(), ".png" )),
+  plot = p, width =10, height = 4, dpi=600)
+
+#effect of genotype in membrane
+dat_sample <- limma_results%>%
+  filter(comparison %in% c("membrane - membrane_C"))
+  
+volcano_labels <- dat_sample %>%
+  group_by(sample, comparison.label) %>%
+  summarise(up_hits = sum(hit_annotation == "hit" & logFC > 0),
+          down_hits = sum(hit_annotation == "hit" & logFC < 0),
+          total_points = n(), .groups = "drop")
+
+p <- ggplot(dat_sample, aes(logFC, -log10(pvalue), colour = hit_annotation, alpha = hit_annotation)) +
+  geom_vline(xintercept = 0, colour = "lightgrey") +
+  geom_hline(yintercept = -Inf, colour = "black") +
+  geom_vline(xintercept = -Inf, colour = "black") +
+  geom_point() +
+  geom_text(aes(label = gsub("[|].+", "", Gene)), colour = "black",
+    show.legend = FALSE,
+    data = subset(dat_sample, hit_annotation == "hit"),
+    vjust = 0, nudge_y = 0.1, size = 2, check_overlap = TRUE) +
+  facet_grid(sample~comparison.label, scales ="fixed") +
+  xlab("log2(fold-change)") +
+  customPlot_DE2 +
+  theme_classic() +
+  theme(strip.background = element_blank(),)+
+  geom_text(data = volcano_labels, aes(x = -3.2, y = 0,
+      label = paste0(
+        "Upregulated hits: ", up_hits, "\n",
+        "Downregulated hits: ", down_hits, "\n",
+        "Total: ", total_points)),
+    hjust = 0, vjust = 0, inherit.aes = FALSE, size = 2.5, colour = "black") +
+  coord_cartesian(clip = "off")+
+  labs(colour = "Hit annotation", alpha = "Hit annotation") 
+
+ggsave(filename = file.path(dir_save, paste0("Volcano_plot_genotype_membrane_", script.version, "_", Sys.Date(), ".png" )),
+  plot = p, width =8, height = 4, dpi=600)
+
+#effect of genotype in cytosol
+dat_sample <- limma_results%>%
+  filter(comparison %in% c("cytosol - cytosol_C"))
+  
+volcano_labels <- dat_sample %>%
+  group_by(sample, comparison.label) %>%
+  summarise(up_hits = sum(hit_annotation == "hit" & logFC > 0),
+          down_hits = sum(hit_annotation == "hit" & logFC < 0),
+          total_points = n(), .groups = "drop")
+
+p <- ggplot(dat_sample, aes(logFC, -log10(pvalue), colour = hit_annotation, alpha = hit_annotation)) +
+  geom_vline(xintercept = 0, colour = "lightgrey") +
+  geom_hline(yintercept = -Inf, colour = "black") +
+  geom_vline(xintercept = -Inf, colour = "black") +
+  geom_point() +
+  geom_text(aes(label = gsub("[|].+", "", Gene)), colour = "black",
+    show.legend = FALSE,
+    data = subset(dat_sample, hit_annotation == "hit"),
+    vjust = 0, nudge_y = 0.1, size = 2, check_overlap = TRUE) +
+  facet_grid(sample~comparison.label, scales ="fixed") +
+  xlab("log2(fold-change)") +
+  customPlot_DE2 +
+  theme_classic() +
+  theme(strip.background = element_blank(),)+
+  geom_text(data = volcano_labels, aes(x = -2.7, y = 0,
+      label = paste0(
+        "Upregulated hits: ", up_hits, "\n",
+        "Downregulated hits: ", down_hits, "\n",
+        "Total: ", total_points)),
+    hjust = 0, vjust = 0, inherit.aes = FALSE, size = 2.5, colour = "black") +
+  coord_cartesian(clip = "off")+
+  labs(colour = "Hit annotation", alpha = "Hit annotation") 
+
+ggsave(filename = file.path(dir_save, paste0("Volcano_plot_genotype_cytosol_", script.version, "_", Sys.Date(), ".png" )),
+  plot = p, width =8, height = 5, dpi=600)
+```
+
+## Fold-change correlation between INT and CTX
+### all hits
+```{r LimmaFoldChangeCorrelationSamples, fig.height = 7}
+customPlot_DE_cor2 <- list(
+  theme_bw(base_size = 12), 
+  labs(caption = caption.text_DE), 
+  scale_colour_manual(values = c("hit INT - hit CTX" = "#CC79A7", "hit INT - no hit CTX" = "#0072B2", "no hit INT - hit CTX" = "#D55E00", "no hit INT - no hit CTX" = "#555555")),
+  scale_alpha_manual(values = c("hit INT - hit CTX" = 1,  "hit INT - no hit CTX" = 1, "no hit INT - hit CTX" = 1,  "no hit INT - no hit CTX" = 0.1)))
+
+sample.cor.data <- limma_results %>%
+  dplyr::filter(sample %in% c("INT", "CTX")) %>%
+  dplyr::filter(comparison %in% c("cytosol - cytosol_C", "membrane - membrane_C")) %>%
+  group_by(Gene, comparison) %>%
+  dplyr::select(Gene, comparison, comparison.label, logFC, sample) %>%
+  spread(key = sample, value = logFC)
+sample.cor.data_i <- limma_results %>%
+  group_by(Gene, comparison) %>%
+  dplyr::select(Gene, comparison, comparison.label, hit_annotation, sample) %>%
+  mutate(hit_annotation = gsub("enriched ", "", hit_annotation)) %>%
+  spread(key = sample, value = hit_annotation)
+names(sample.cor.data_i)[c(4,5)] <- paste0("hit_", names(sample.cor.data_i)[c(4,5)])
+sample.cor.data <- left_join(sample.cor.data, sample.cor.data_i)
+rm(sample.cor.data_i)
+sample.cor.data <- na.omit(sample.cor.data)
+sample.cor.data$hit <- paste(sample.cor.data$hit_INT, "INT -", sample.cor.data$hit_CTX, "CTX")
+sample.cor.data$hit <- factor(sample.cor.data$hit, ordered = TRUE,
+                       levels = c("hit INT - hit CTX",
+                                  "hit INT - no hit CTX",
+                                  "no hit INT - hit CTX",
+                                  "no hit INT - no hit CTX"))
+no.of.comparisons <- length(unique(sample.cor.data$comparison))
+max.comp.nchar <- max(nchar(unique(sample.cor.data$comparison)))
+max.comp.nchar <- ifelse(max.comp.nchar <= 70, 70, max.comp.nchar)
+gr.width.multiplikator <- round(max.comp.nchar / 70 * 5, digits = 2)
+gr.width <- 4 + ceiling(sqrt(no.of.comparisons)) * gr.width.multiplikator
+gr.height <- 4 + floor(sqrt(no.of.comparisons)) * 5
+ggplot(data = sample.cor.data, aes(INT, CTX, colour = hit, alpha = hit)) +
+  geom_abline() +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0) +
+  geom_point() +
+  facet_wrap(~ comparison.label, scale = "free") +
+  geom_text(aes(label = gsub("[|].+", "", Gene)), colour = "black", show.legend = FALSE, 
+            data = subset(sample.cor.data, hit != "no hit INT - no hit CTX"),
+            vjust = 0, nudge_y = 0.1, size = 2, check_overlap = TRUE) +
+  customPlot_DE_cor2 +
+  ggtitle("Fold-change correlation plot INT vs CTX")
+ggsave(file.path(dir_save, paste0("Fold_change_correlation_INT_vs_CTX_", script.version, ".png")), width = gr.width, height = gr.height)
+write.csv(sample.cor.data, file = file.path(dir_save, paste0("Fold_change_correlation_data_INT_vs_CTX_", script.version, ".csv")), row.names = FALSE)
+```
+
+```{r LimmaFoldChangeCorrelationSamples}
+library(ggrepel)
+## Save limma results
+sample.cor.data <- sample.cor.data %>%
+  mutate(
+    direction = case_when(
+      hit == "hit INT - hit CTX" & INT > 0 & CTX > 0 ~ "Up in both",
+      hit == "hit INT - hit CTX" & INT < 0 & CTX < 0 ~ "Down in both",
+      hit == "hit INT - hit CTX" & INT > 0 & CTX < 0 ~ "Up INT / Down CTX",
+      hit == "hit INT - hit CTX" & INT < 0 & CTX > 0 ~ "Down INT / Up CTX",
+      TRUE ~ "Other"))
+
+direction_cols <- c("Up in both"= "#7EEC57",
+  "Down in both"         = "#F8766D",
+  "Up INT / Down CTX"    = "#00BFC4",
+  "Down INT / Up CTX"    = "#8494FF",
+  "Other"                = "#555555")
+direction_alpha <- c("Up in both" = 1,
+  "Down in both"         = 1,
+  "Up INT / Down CTX"    = 1,
+  "Down INT / Up CTX"    = 1,
+  "Other"                = 0.1)
+legend_groups <- c("Up in both",
+  "Down in both",
+  "Up INT / Down CTX",
+  "Down INT / Up CTX")
+customPlot_DE_cor2 <- list(
+  theme_minimal(),
+  labs(x = "INT log2(fold-change)",
+    y = "CTX log2(fold-change)"),
+  scale_colour_manual(values = direction_cols, breaks = legend_groups),
+  scale_alpha_manual(values = direction_alpha, breaks = legend_groups))
+
+ggplot(data = sample.cor.data,
+       aes(INT, CTX, colour = direction, alpha = direction)) +
+  geom_abline(colour = "grey50", linetype = "dotted") +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0) +
+  geom_point() +
+  facet_wrap(~ comparison.label, scale = "free", ncol=1) +
+  geom_text_repel(
+    aes(label = gsub("[|].+", "", Gene)),
+    colour = "black",
+    data = subset(sample.cor.data, hit == "hit INT - hit CTX"),
+    size = 2.5, max.overlaps = Inf, force = 1.5,
+    box.padding = 0.3, point.padding = 0.1) +
+  customPlot_DE_cor2 +
+  guides(alpha = "none",
+    colour = guide_legend(override.aes = list(size = 4),nrow = 1, byrow = TRUE))+   # Bigger colour legend dots
+  coord_cartesian(xlim = c(-3, 3.5), ylim = c(-2, 3) )+
+  labs(x = "Inhibitory log2(fold-change)",
+       y = "Excitatory log2(fold-change)") +
+  theme(legend.position = "bottom")
+
+ggsave(file.path(dir_save, paste0("Fold_change_correlation_INT_vs_CTX_hits only v2_", script.version, ".png")), width = 6.5, height = 10, dpi =600)
+```
+
+```{r LimmaSave}
+write.csv(limma_results, file.path(dir_save, paste0("Limma_results_filtered_", script.version,"_", Sys.Date(), ".csv")), row.names = FALSE)
+```
+
+# Save R workspace
+
+```{r}
+save.image(file.path(dir_save, paste0("Workspace_", script.version, ".RData")))
+# load(file.path(dir_save, paste0("Workspace_", script.version, ".RData")))
+```
+
+# GO term enrichment analysis
+## Preparation
+```{r GO_IDLUT}
+calculateFE <- function(GeneRatio, BgRatio) #function to calculate fold enirchment/Odds ratio
+{ GeneRatio <- as.numeric(unlist(str_split(GeneRatio, pattern = "/"))) #ratio for each gene
+  BgRatio <- as.numeric(unlist(str_split(BgRatio, pattern = "/"))) #ratio for background
+  odds_ratio <- (GeneRatio[1] / GeneRatio[2]) / (BgRatio[1] / BgRatio[2]) #odds ratio
+  return(odds_ratio)}
+ID_LUT <- bitr(geneID = cdata$Gene, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+names(ID_LUT) <- c("Gene", "ENTREZID")
+```
+
+## Differential expression analysis
+```{r GO_DE}
+limma_results <- left_join(limma_results, ID_LUT) #join GO ID columns to Limma data
+ego_data <- limma_results %>%
+  dplyr::filter(!is.na(ENTREZID), hit_annotation %in% c("hit")) %>% #only use proteins with ID and "hits"
+  dplyr::select(ENTREZID, sample, comparison, logFC) %>%
+  distinct() %>% 
+  mutate(comparison = gsub("[.]", "_", comparison)) %>%
+  mutate(grouping = paste(sample, comparison, sep = "___")) %>% #create new grouping variable
+  mutate(direction = ifelse(logFC > 0, "upregulated", "downregulated")) %>% #define up or downregulated
+  dplyr::select(ENTREZID, grouping, direction)
+```
+
+### Cellular compartment
+```{r GO_DE_CC}
+ego_results_DE_CC <- NULL
+try(ego_results_DE_CC <- compareCluster(
+  ENTREZID ~ grouping + direction, #grouping by sample and up/downregulated
+  data = ego_data,  #use dataset generated with ENTREZID
+  fun = "enrichGO", #clusterProfiler::enrichGO()
+  OrgDb = org.Hs.eg.db, #human Org database
+  keyType = "ENTREZID",
+  ont = "CC", #cellular compartment
+  readable = TRUE,
+  universe = ID_LUT$ENTREZID)) #background genes
+
+if (!is.null(ego_results_DE_CC)) {
+  ego_results_DE_CC_table <- ego_results_DE_CC@compareClusterResult %>% 
+    mutate(comparison = gsub(".+___", "", grouping),
+      sample = gsub("___.+", "", grouping)) %>%
+    group_by(ID, sample, comparison, direction) %>%
+    mutate(odds_ratio = calculateFE(GeneRatio, BgRatio)) %>%
+    ungroup()
+  
+  ego_results_DE_CC_table$Description <- factor(
+    ego_results_DE_CC_table$Description,
+    levels = unique(rev(ego_results_DE_CC_table$Description)))
+
+  ego_sub <- ego_results_DE_CC_table %>%
+    mutate(is_cyt_mem = grepl("cytosol\\s*-\\s*cytosol_C", grouping, ignore.case = TRUE) |
+                   grepl("membrane\\s*-\\s*membrane_C", grouping, ignore.case = TRUE)) %>%
+    group_by(sample, comparison, direction) %>%
+    arrange(p.adjust)%>% #arrange by smallest adjusted p-value first
+    slice_head(n = 10) %>% # Keep top 10 per group
+    group_by(is_cyt_mem) %>%
+    arrange(p.adjust, .by_group = TRUE) %>%
+    mutate(Description_reordered = factor(Description, levels = unique(Description))) %>%
+    ungroup()
+}
+
+#horizontal bar plots 
+df<-ego_results_DE_CC_table
+df<-df%>%
+  filter(comparison %in% c("membrane - membrane_C", "cytosol - cytosol_C"))
+
+df$logP <- -log10(df$p.adjust)
+df <- df %>%
+  arrange(desc(logP), .by_group = TRUE)%>%
+  group_by(Cluster) %>%
+  slice_max(order_by = logP, n = 10, with_ties = FALSE)
+
+#define custom plot colours
+df$direction <- factor(df$direction, levels = c("downregulated", "upregulated"))
+direction_colors <- c("downregulated" = "#F8766D", "upregulated" = "#00B358")
+df <- df %>%
+  mutate(direction_colors = case_when(
+    str_detect(tolower(Cluster), "cytosol") & direction == "downregulated" ~ "Downregulated cytosol",
+    str_detect(tolower(Cluster), "cytosol") & direction == "upregulated"   ~ "Upregulated cytosol",
+    str_detect(tolower(Cluster), "membrane") & direction == "downregulated" ~ "Downregulated membrane",
+    str_detect(tolower(Cluster), "membrane") & direction == "upregulated"   ~ "Upregulated membrane",
+    TRUE ~ "other"))
+
+ego_results_DE_CC_table2 <- ego_results_DE_CC_table %>%
+  filter(comparison %in% c("cytosol - cytosol_C", "membrane - membrane_C")) %>%
+  group_by(sample, comparison, direction) %>%
+  arrange(p.adjust, .by_group = TRUE) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  # Convert all factors to character before saving
+  mutate(across(where(is.factor), as.character))
+
+write.csv(ego_results_DE_CC_table2,
+  file.path(dir_save, paste0("GO_enrichment_DE_CC_limma_results_top10_", script.version, ".csv")),
+  row.names = FALSE)
+
+#count how many times each gene appears in GO terms
+gene_counts_CC <- ego_results_DE_CC_table %>%
+  filter(comparison %in% c("cytosol - cytosol_C", "membrane - membrane_C"))%>%
+  group_by(sample)%>%
+  separate_rows(geneID, sep = "/") %>% # split by "/" 
+  mutate(geneID = str_trim(geneID)) %>%
+  count(geneID, sort = TRUE)%>% #count how many times each gene appears
+  pivot_wider(
+    names_from = sample,
+    values_from = n,
+    values_fill = 0 )
+
+write.csv(gene_counts_CC, file.path(dir_save, paste0("GO_gene_counts_CC_", script.version, ".csv")), row.names = FALSE)
+
+#define custom plot colours
+df$direction <- factor(df$direction, levels = c("downregulated", "upregulated"))
+direction_colors <- c("downregulated" = "#F8766D", "upregulated" = "#00B358")
+df <- df %>%
+  mutate(direction_colors = case_when(
+    sample == "CTX" & direction == "downregulated" ~ "Downregulated CTX",
+    sample == "CTX"  & direction == "upregulated"   ~ "Upregulated CTX",
+    sample == "INT"  & direction == "downregulated" ~ "Downregulated INT",
+    sample == "INT"  & direction == "upregulated"   ~ "Upregulated INT",
+    TRUE ~ "other" 
+  ))
+outline_color <- c("Downregulated CTX"   = "#F8766D",     
+                    "Upregulated CTX"     = "#00B358",     
+                    "Downregulated INT"  = "#F8766D",     
+                    "Upregulated INT"    = "#00B358" )
+fill_color <- c("Downregulated CTX"   = "#F8766D",     
+                "Upregulated CTX"     = "#00B358",       
+                "Downregulated INT"  = "white",    
+                "Upregulated INT"    = "white")
+df$direction_colors <- factor(df$direction_colors, levels = c("Downregulated CTX", "Upregulated CTX", "Downregulated INT", "Upregulated INT"))
+
+#plot all together - separated by cytosol/membrane
+for (s in unique(df$comparison)) {
+  plot_data <- df %>%      
+  filter(comparison == s)
+  
+p <- ggplot(plot_data, aes(x = logP, y = reorder_within(Description, logP, Cluster), fill = direction_colors, color=direction_colors)) +
+            geom_col(width = 0.4) +
+            scale_fill_manual(values = fill_color) +
+            scale_color_manual(values = outline_color) +
+            scale_y_reordered() +
+            facet_wrap(Cluster ~ ., scales = "free", space = "free_y", ncol=2) +
+            theme_minimal() +
+            labs(x = expression(-log[10](p.adjust)),
+              y = NULL, title = "i) Cellular Compartment") +
+            theme(panel.background = element_rect(fill = "white", color = NA), 
+              plot.background = element_rect(fill = "white", color = NA),   
+              axis.text.y = element_text(color = "black", size = 7, lineheight = 0.9),
+              axis.text.x = element_text(color = "black"),
+              plot.title = element_text(hjust = 0.5),
+              strip.text.y = element_text(angle = 0, hjust = 0),
+              panel.grid.major = element_blank(),  
+              panel.grid.minor = element_blank(),
+              strip.background = element_blank(),
+              strip.text.x = element_blank(),
+              legend.title = element_blank())+
+          theme(legend.position = "bottom")
+          print(p)
+          ggsave(file.path(dir_save, paste0("GO_enrichment_DE_CC_barplot_", s, "-",  script.version, "_", Sys.Date(), ".png")), p,  width = 10, height = 5, dpi=600)
+}
+```
+
+#### CC - for fraction separation
+```{r VolcanoFraction}
+#horizontal bar plots 
+df<-ego_results_DE_CC_table
+df<-df%>%
+  filter(comparison %in% c("membrane - cytosol", "membrane_C - cytosol_C"))
+
+df$logP <- -log10(df$p.adjust)
+df <- df %>%
+  arrange(desc(logP), .by_group = TRUE)%>%
+  group_by(Cluster) %>%
+  slice_max(order_by = logP, n = 10, with_ties = FALSE)
+
+# df <- df %>% #if you want to annotate the genes contributing to each GO term
+#   mutate(
+#     geneID_wrapped = str_wrap(geneID, width = 50),  # wrap long gene lists
+#     Description_label = paste0(Description, "\n", geneID_wrapped)  # Description on top, genes below
+#   )
+
+#define custom plot colours
+df$direction <- factor(df$direction, levels = c("downregulated", "upregulated"))
+direction_colors <- c("downregulated" = "#F8766D", "upregulated" = "#00B358")
+df <- df %>%
+  mutate(direction_colors = case_when(
+    str_detect(tolower(Cluster), "_C") & direction == "downregulated" ~ "Downregulated control",
+    str_detect(tolower(Cluster), "_C") & direction == "upregulated"   ~ "Upregulated control",
+    !str_detect(tolower(Cluster), "_C") & direction == "downregulated" ~ "Downregulated patient",
+    !str_detect(tolower(Cluster), "_C") & direction == "upregulated"   ~ "Upregulated patient",
+    TRUE ~ "other" 
+  ))
+outline_color <- c("Downregulated control"   = "#F8766D",     
+                    "Upregulated control"     = "#00B358",     
+                    "Downregulated patient"  = "#F8766D",     
+                    "Upregulated patient"    = "#00B358" )
+fill_color <- c("Downregulated control"   = "white",     
+                "Upregulated control"     = "white",       
+                "Downregulated patient"  = "#F8766D",    
+                "Upregulated patient"    = "#00B358")
+for (s in unique(df$sample)) {
+  plot_data <- df %>%      
+  filter(sample == s)
+          p <- ggplot(plot_data, aes(x = logP, y = reorder_within(Description, logP, Cluster), fill = direction_colors, color=direction_colors)) +
+            geom_col(width = 0.4) +
+            scale_fill_manual(values = fill_color) +
+            scale_color_manual(values = outline_color) +
+            scale_y_reordered() +
+            facet_wrap(Cluster ~ ., scales = "free_y", space = "free_y") +
+            theme_minimal() +
+            labs(
+              x = expression(-log[10](p.adjust)),
+              y = NULL,
+              title = "Cellular Compartment"
+            ) +
+            theme(
+              panel.background = element_rect(fill = "white", color = NA), 
+              plot.background = element_rect(fill = "white", color = NA),   
+              axis.text.y = element_text(color = "black", size = 7, lineheight = 0.9),
+              axis.text.x = element_text(color = "black"),
+              plot.title = element_text(hjust = 0.5),
+              strip.text.y = element_text(angle = 0, hjust = 0),
+              panel.grid.major = element_blank(),  
+              panel.grid.minor = element_blank(),
+              strip.background = element_blank(),
+              strip.text.x = element_blank(),
+              legend.title = element_blank()
+            )
+          print(p)
+          ggsave(file.path(dir_save, paste0("GO_enrichment_DE_CC_barplot_for fractions_", s, "_", script.version, "_", Sys.Date(), ".png")), p,  width = 6, height = 4, dpi=600)
+}
+```
+
+### Molecular function
+```{r GO_DE_MF}
+ego_results_DE_MF <- NULL
+try(ego_results_DE_MF <- compareCluster(
+  ENTREZID ~ grouping + direction, #grouping by sample and up/downregulated
+  data = ego_data,  #use dataset generated with ENTREZID
+  fun = "enrichGO", #clusterProfiler::enrichGO()
+  OrgDb = org.Hs.eg.db, #human Org database
+  keyType = "ENTREZID",
+  ont = "MF", #cellular compartment
+  readable = TRUE,
+  universe = ID_LUT$ENTREZID)) #background genes
+
+if (!is.null(ego_results_DE_MF)) {
+  ego_results_DE_MF_table <- ego_results_DE_MF@compareClusterResult %>% 
+    mutate(comparison = gsub(".+___", "", grouping),
+      sample = gsub("___.+", "", grouping)) %>%
+    group_by(ID, sample, comparison, direction) %>%
+    mutate(odds_ratio = calculateFE(GeneRatio, BgRatio)) %>%
+    ungroup()
+  
+  ego_results_DE_MF_table$Description <- factor(
+    ego_results_DE_MF_table$Description,
+    levels = unique(rev(ego_results_DE_MF_table$Description)))
+
+  ego_sub <- ego_results_DE_MF_table %>%
+    mutate(is_cyt_mem = grepl("cytosol\\s*-\\s*cytosol_C", grouping, ignore.case = TRUE) |
+                   grepl("membrane\\s*-\\s*membrane_C", grouping, ignore.case = TRUE)) %>%
+    group_by(sample, comparison, direction) %>%
+    arrange(p.adjust)%>% #arrange by smallest adjusted p-value first
+    slice_head(n = 10) %>% # Keep top 10 per group
+    group_by(is_cyt_mem) %>%
+    arrange(p.adjust, .by_group = TRUE) %>%
+    mutate(Description_reordered = factor(Description, levels = unique(Description))) %>%
+    ungroup()
+}
+
+#horizontal bar plots 
+df<-ego_results_DE_MF_table
+df<-df%>%
+  filter(comparison %in% c("membrane - membrane_C", "cytosol - cytosol_C"))
+
+df$logP <- -log10(df$p.adjust)
+df <- df %>%
+  arrange(desc(logP), .by_group = TRUE)%>%
+  group_by(Cluster) %>%
+  slice_max(order_by = logP, n = 10, with_ties = FALSE)
+
+#define custom plot colours
+df$direction <- factor(df$direction, levels = c("downregulated", "upregulated"))
+direction_colors <- c("downregulated" = "#F8766D", "upregulated" = "#00B358")
+df <- df %>%
+  mutate(direction_colors = case_when(
+    str_detect(tolower(Cluster), "cytosol") & direction == "downregulated" ~ "Downregulated cytosol",
+    str_detect(tolower(Cluster), "cytosol") & direction == "upregulated"   ~ "Upregulated cytosol",
+    str_detect(tolower(Cluster), "membrane") & direction == "downregulated" ~ "Downregulated membrane",
+    str_detect(tolower(Cluster), "membrane") & direction == "upregulated"   ~ "Upregulated membrane",
+    TRUE ~ "other"))
+
+ego_results_DE_MF_table2 <- ego_results_DE_MF_table %>%
+  filter(comparison %in% c("cytosol - cytosol_C", "membrane - membrane_C")) %>%
+  group_by(sample, comparison, direction) %>%
+  arrange(p.adjust, .by_group = TRUE) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  # Convert all factors to character before saving
+  mutate(across(where(is.factor), as.character))
+
+write.csv(ego_results_DE_MF_table2,
+  file.path(dir_save, paste0("GO_enrichment_DE_MF_limma_results_top10_", script.version, ".csv")),
+  row.names = FALSE)
+
+#count how many times each gene appears in GO terms
+gene_counts_MF <- ego_results_DE_MF_table %>%
+  filter(comparison %in% c("cytosol - cytosol_C", "membrane - membrane_C"))%>%
+  group_by(sample)%>%
+  separate_rows(geneID, sep = "/") %>% # split by "/" 
+  mutate(geneID = str_trim(geneID)) %>%
+  count(geneID, sort = TRUE)%>% #count how many times each gene appears
+  pivot_wider(
+    names_from = sample,
+    values_from = n,
+    values_fill = 0 )
+
+write.csv(gene_counts_MF, file.path(dir_save, paste0("GO_gene_counts_MF_", script.version, ".csv")), row.names = FALSE)
+
+#define custom plot colours
+df$direction <- factor(df$direction, levels = c("downregulated", "upregulated"))
+direction_colors <- c("downregulated" = "#F8766D", "upregulated" = "#00B358")
+df <- df %>%
+  mutate(direction_colors = case_when(
+    sample == "CTX" & direction == "downregulated" ~ "Downregulated CTX",
+    sample == "CTX"  & direction == "upregulated"   ~ "Upregulated CTX",
+    sample == "INT"  & direction == "downregulated" ~ "Downregulated INT",
+    sample == "INT"  & direction == "upregulated"   ~ "Upregulated INT",
+    TRUE ~ "other" 
+  ))
+outline_color <- c("Downregulated CTX"   = "#F8766D",     
+                    "Upregulated CTX"     = "#00B358",     
+                    "Downregulated INT"  = "#F8766D",     
+                    "Upregulated INT"    = "#00B358" )
+fill_color <- c("Downregulated CTX"   = "#F8766D",     
+                "Upregulated CTX"     = "#00B358",       
+                "Downregulated INT"  = "white",    
+                "Upregulated INT"    = "white")
+df$direction_colors <- factor(df$direction_colors, levels = c("Downregulated CTX", "Upregulated CTX", "Downregulated INT", "Upregulated INT"))
+
+#plot all together - separated by cytosol/membrane
+for (s in unique(df$comparison)) {
+  plot_data <- df %>%      
+  filter(comparison == s)#%>%
+    #mutate(Description = str_wrap(Description, width = 50))
+
+  
+p <- ggplot(plot_data, aes(x = logP, y = reorder_within(Description, logP, Cluster), fill = direction_colors, color=direction_colors)) +
+            geom_col(width = 0.4) +
+            scale_fill_manual(values = fill_color) +
+            scale_color_manual(values = outline_color) +
+            scale_y_reordered() +
+            facet_wrap(Cluster ~ ., scales = "free", space = "free_y") +
+            theme_minimal() +
+            labs(x = expression(-log[10](p.adjust)),
+              y = NULL, title = "ii) Molecular Function") +
+            theme(panel.background = element_rect(fill = "white", color = NA), 
+              plot.background = element_rect(fill = "white", color = NA),   
+              axis.text.y = element_text(color = "black", size = 7, lineheight = 0.9),
+              axis.text.x = element_text(color = "black"),
+              plot.title = element_text(hjust = 0.5),
+              strip.text.y = element_text(angle = 0, hjust = 0),
+              panel.grid.major = element_blank(),  
+              panel.grid.minor = element_blank(),
+              strip.background = element_blank(),
+              strip.text.x = element_blank(),
+              legend.title = element_blank())+
+          theme(legend.position = "none")
+          print(p)
+          ggsave(file.path(dir_save, paste0("GO_enrichment_DE_MF_barplot_", s, "-",  script.version, "_", Sys.Date(), ".png")), p,  width = 5.05, height = 3.2, dpi=600)
+}
+```
+
+### Biological process
+
+```{r GO_DE_BP}
+ego_results_DE_BP <- NULL
+try(ego_results_DE_BP <- compareCluster(
+  ENTREZID ~ grouping + direction, #grouping by sample and up/downregulated
+  data = ego_data,  #use dataset generated with ENTREZID
+  fun = "enrichGO", #clusterProfiler::enrichGO()
+  OrgDb = org.Hs.eg.db, #human Org database
+  keyType = "ENTREZID",
+  ont = "BP", #cellular compartment
+  readable = TRUE,
+  universe = ID_LUT$ENTREZID)) #background genes
+
+if (!is.null(ego_results_DE_BP)) {
+  ego_results_DE_BP_table <- ego_results_DE_BP@compareClusterResult %>% 
+    mutate(comparison = gsub(".+___", "", grouping),
+      sample = gsub("___.+", "", grouping)) %>%
+    group_by(ID, sample, comparison, direction) %>%
+    mutate(odds_ratio = calculateFE(GeneRatio, BgRatio)) %>%
+    ungroup()
+  
+  ego_results_DE_BP_table$Description <- factor(
+    ego_results_DE_BP_table$Description,
+    levels = unique(rev(ego_results_DE_BP_table$Description)))
+
+  ego_sub <- ego_results_DE_BP_table %>%
+    mutate(is_cyt_mem = grepl("cytosol\\s*-\\s*cytosol_C", grouping, ignore.case = TRUE) |
+                   grepl("membrane\\s*-\\s*membrane_C", grouping, ignore.case = TRUE)) %>%
+    group_by(sample, comparison, direction) %>%
+    arrange(p.adjust)%>% #arrange by smallest adjusted p-value first
+    slice_head(n = 10) %>% # Keep top 10 per group
+    group_by(is_cyt_mem) %>%
+    arrange(p.adjust, .by_group = TRUE) %>%
+    mutate(Description_reordered = factor(Description, levels = unique(Description))) %>%
+    ungroup()
+}
+
+#horizontal bar plots 
+df<-ego_results_DE_BP_table
+df<-df%>%
+  filter(comparison %in% c("membrane - membrane_C", "cytosol - cytosol_C"))
+
+df$logP <- -log10(df$p.adjust)
+df <- df %>%
+  arrange(desc(logP), .by_group = TRUE)%>%
+  group_by(Cluster) %>%
+  slice_max(order_by = logP, n = 10, with_ties = FALSE)
+
+#define custom plot colours
+df$direction <- factor(df$direction, levels = c("downregulated", "upregulated"))
+direction_colors <- c("downregulated" = "#F8766D", "upregulated" = "#00B358")
+df <- df %>%
+  mutate(direction_colors = case_when(
+    str_detect(tolower(Cluster), "cytosol") & direction == "downregulated" ~ "Downregulated cytosol",
+    str_detect(tolower(Cluster), "cytosol") & direction == "upregulated"   ~ "Upregulated cytosol",
+    str_detect(tolower(Cluster), "membrane") & direction == "downregulated" ~ "Downregulated membrane",
+    str_detect(tolower(Cluster), "membrane") & direction == "upregulated"   ~ "Upregulated membrane",
+    TRUE ~ "other"))
+
+ego_results_DE_BP_table2 <- ego_results_DE_BP_table %>%
+  filter(comparison %in% c("cytosol - cytosol_C", "membrane - membrane_C")) %>%
+  group_by(sample, comparison, direction) %>%
+  arrange(p.adjust, .by_group = TRUE) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  # Convert all factors to character before saving
+  mutate(across(where(is.factor), as.character))
+
+write.csv(ego_results_DE_BP_table2,
+  file.path(dir_save, paste0("GO_enrichment_DE_BP_limma_results_top10_", script.version, ".csv")),
+  row.names = FALSE)
+
+#count how many times each gene appears in GO terms
+gene_counts_BP <- ego_results_DE_BP_table %>%
+  filter(comparison %in% c("cytosol - cytosol_C", "membrane - membrane_C"))%>%
+  group_by(sample)%>%
+  separate_rows(geneID, sep = "/") %>% # split by "/" 
+  mutate(geneID = str_trim(geneID)) %>%
+  count(geneID, sort = TRUE)%>% #count how many times each gene appears
+  pivot_wider(
+    names_from = sample,
+    values_from = n,
+    values_fill = 0 )
+
+write.csv(gene_counts_BP, file.path(dir_save, paste0("GO_gene_counts_BP_", script.version, ".csv")), row.names = FALSE)
+
+#define custom plot colours
+df$direction <- factor(df$direction, levels = c("downregulated", "upregulated"))
+direction_colors <- c("downregulated" = "#F8766D", "upregulated" = "#00B358")
+df <- df %>%
+  mutate(direction_colors = case_when(
+    sample == "CTX" & direction == "downregulated" ~ "Downregulated CTX",
+    sample == "CTX"  & direction == "upregulated"   ~ "Upregulated CTX",
+    sample == "INT"  & direction == "downregulated" ~ "Downregulated INT",
+    sample == "INT"  & direction == "upregulated"   ~ "Upregulated INT",
+    TRUE ~ "other" 
+  ))
+outline_color <- c("Downregulated CTX"   = "#F8766D",     
+                    "Upregulated CTX"     = "#00B358",     
+                    "Downregulated INT"  = "#F8766D",     
+                    "Upregulated INT"    = "#00B358" )
+fill_color <- c("Downregulated CTX"   = "#F8766D",     
+                "Upregulated CTX"     = "#00B358",       
+                "Downregulated INT"  = "white",    
+                "Upregulated INT"    = "white")
+df$direction_colors <- factor(df$direction_colors, levels = c("Downregulated CTX", "Upregulated CTX", "Downregulated INT", "Upregulated INT"))
+
+#plot all together - separated by cytosol/membrane
+for (s in unique(df$comparison)) {
+  plot_data <- df %>%      
+  filter(comparison == s)%>%
+    mutate(Description = str_wrap(Description, width = 50))
+  
+p <- ggplot(plot_data, aes(x = logP, y = reorder_within(Description, logP, Cluster), fill = direction_colors, color=direction_colors)) +
+            geom_col(width = 0.4) +
+            scale_fill_manual(values = fill_color) +
+            scale_color_manual(values = outline_color) +
+            scale_y_reordered() +
+            facet_wrap(Cluster ~ ., scales = "free", space = "free_y") +
+            theme_minimal() +
+            labs(x = expression(-log[10](p.adjust)),
+              y = NULL, title = "iii) Molecular Function") +
+            theme(panel.background = element_rect(fill = "white", color = NA), 
+              plot.background = element_rect(fill = "white", color = NA),   
+              axis.text.y = element_text(color = "black", size = 7, lineheight = 0.9),
+              axis.text.x = element_text(color = "black"),
+              plot.title = element_text(hjust = 0.5),
+              strip.text.y = element_text(angle = 0, hjust = 0),
+              panel.grid.major = element_blank(),  
+              panel.grid.minor = element_blank(),
+              strip.background = element_blank(),
+              strip.text.x = element_blank(),
+              legend.title = element_blank())+
+          theme(legend.position = "none")
+          print(p)
+          ggsave(file.path(dir_save, paste0("GO_enrichment_DE_BP_barplot_", s, "-",  script.version, "_", Sys.Date(), ".png")), p,  width = 3.5, height = 4, dpi=600)
+}
+```
+
+# Save Methods for analysis
+
+```{r SaveMethods}
+method.description <- "For the proteomics data analysis the raw output files of FragPipe (protein.tsv files files) were processed using the R programming environment (ISBN 3-900051-07-0)."
+method.description <- append(method.description, "Initial data processing included filtering out contaminants and reverse proteins. Only proteins quantified with at least 2 razor peptides (with Razor.Peptides >= 2) were considered for further analysis.")
+method.description <- append(method.description, paste(nrow(cdata), "proteins passed the quality control filters."))
+method.description <- append(method.description, glue("In order to correct for technical variability, batch effects were removed using the 'removeBatchEffect' function of the limma package (PMID: 25605792) on the log2 transformed raw TMT reporter ion intensities ('channel' columns). Subsequently, normalization was performed using the 'normalizeVSN' function of the limma package (VSN - variance stabilization normalization - PMID: 12169536)."))
+method.description <- append(method.description, "Differential expression analysis was performed using the moderated t-test provided by the limma package (PMID: 25605792). The model accounted for replicate information by including it as a factor in the design matrix passed to the 'lmFit' function.")
+if ("fdrtool" %in% limma_results$hit_annotation_method)
+{
+  method.description <- append(method.description, "To obtain p-values and false discovery rates (FDRs), the 'fdrtool' function from the fdrtool package (PMID: 18441000) was used to analyze the t-values produced by limma for certain comparisons.")
+}
+method.description <- append(method.description, glue("Proteins were annotated as hits if they had a false discovery rate (FDR) below {fdr_hit_threshold} and an absolute fold change greater than {fc_hit_threshold}." ))
+method.description <- append(method.description, glue("Clustering {heatmap_selection_label} based on the median protein abundances normalized by median of control condition was conducted to identify groups of proteinsimilar patterns across conditions. The 'kmeans' method was employed, using Euclidean distance as the distance metric and 'ward.D2' linkage for hierarchical clustering. The optimal number of clusters ({cluster.number}) was determined using the Elbow method, which identifies the point where the within-group sum of squares stabilizes."))
+method.description <- append(method.description, "Gene ontology (GO) enrichment analysis was performed using the 'compareCluster' function of the 'clusterProfiler' package (PMID: 22455463), which assesses over-representation of GO terms in the dataset relative to the background gene set. Enrichment was conducted for the following GO categories: Cellular Component (CC), Molecular Function (MF), and Biological Process (BP). The analysis was performed using 'org.Hs.eg.db' as the reference database. The odds ratio ('odds_ratio') for each GO term was calculated by comparing the proportion of genes associated with that term in the dataset ('GeneRatio') to the proportion in the background set ('BgRatio'). An odds ratio greater than 1 indicates that the GO term is enriched in the dataset compared to the expected background.")
+method.description <- paste(method.description, collapse = " ")
+writeLines(text = method.description, con = file.path(dir_save, paste0("Methods_", script.version, ".txt")))
+```
+
+# Save R workspace
+
+```{r}
+#save.image(file.path(dir_save, paste0("Workspace_", script.version, ".RData")))
+# load(file.path(dir_save, paste0("Workspace_", script.version, ".RData")))
+```
+
+# Save Session information
+
+```{r SaveSessionInfo}
+sessionInfo()
+```
+
